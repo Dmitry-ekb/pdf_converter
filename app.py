@@ -9,6 +9,7 @@ st.set_page_config(page_title="PDF Затраты: Анализ и Подсчё�
 st.title("📊 Анализ затрат из PDF (Счета и УПД)")
 st.markdown("Загрузите PDF-файлы. Приложение поддерживает обычные счета и УПД.")
 
+
 def parse_money(value):
     if value is None:
         return None
@@ -22,6 +23,7 @@ def parse_money(value):
     except ValueError:
         return None
 
+
 def looks_like_item_row(row):
     if not row or len(row) < 4:
         return False
@@ -29,6 +31,7 @@ def looks_like_item_row(row):
     numeric_count = sum(1 for n in nums if n is not None)
     has_text = any(c and len(str(c).strip()) > 3 for c in row)
     return numeric_count >= 2 and has_text
+
 
 def find_header_and_cols(table):
     for r_idx, row in enumerate(table[:8]):
@@ -51,29 +54,60 @@ def find_header_and_cols(table):
                 return r_idx, col_map
     return None, None
 
+
 def extract_upd_items(text, filename):
     """Специальный парсер для УПД (ищет строку с товаром)."""
     items = []
-    # УПД обычно содержит строку вида: "00-00000022 1 Отсев щебня (м3) 113 м3 20.00 696.72 13 934.43"
-    # Ищем паттерн: код, номер, наименование, ед.изм., кол-во, цена, сумма
-    # Регулярное выражение для поиска строк с товарами в УПД
-    pattern = re.compile(
-        r'(\d{2}-\d{8})\s+(\d+)\s+([А-Яа-яЁёA-Za-z0-9\s"\'\-\(\)\.\,]+?)\s+(\d+)\s+(м3|шт|т|кг|л|м2)\s+([\d.,]+)\s+([\d\s.,]+)\s+([\d\s.,]+)',
-        re.IGNORECASE
-    )
-    
-    matches = pattern.findall(text)
-    for match in matches:
-        code, num, name, qty, unit, price, total = match
-        name = re.sub(r'\s+', ' ', name).strip()
-        items.append({
-            '_Файл': filename,
-            'Наименование': f"{name} ({code})",
-            'Кол-во': parse_money(qty),
-            'Цена': parse_money(price),
-            'Сумма': parse_money(total),
-        })
+    lines = text.split('\n')
+    for line in lines:
+        # Ищем строки, которые содержат код товара и ключевые слова
+        if re.search(r'\d{2}-\d{8}', line) and ('щебень' in line.lower() or 'отсев' in line.lower()):
+            parts = line.split()
+            try:
+                # Ищем индекс единицы измерения
+                unit_idx = -1
+                for i, p in enumerate(parts):
+                    if p.lower() in ['м3', 'шт', 'т', 'кг', 'л', 'м2', 'рейс']:
+                        unit_idx = i
+                        break
+                if unit_idx == -1:
+                    continue
+                
+                # Количество — элемент перед единицей измерения
+                qty = parse_money(parts[unit_idx - 1])
+                # Цена — элемент после единицы измерения
+                price = parse_money(parts[unit_idx + 1])
+                
+                # Сумма может быть разбита на части
+                total_parts = []
+                for p in parts[unit_idx + 2:]:
+                    if parse_money(p) is not None:
+                        total_parts.append(p)
+                    else:
+                        break
+                
+                if len(total_parts) >= 2:
+                    total = parse_money(total_parts[0] + total_parts[1])
+                elif len(total_parts) == 1:
+                    total = parse_money(total_parts[0])
+                else:
+                    total = None
+                
+                name_parts = parts[2:unit_idx - 1]
+                name = ' '.join(name_parts)
+                
+                if qty is not None and price is not None and total is not None:
+                    items.append({
+                        '_Файл': filename,
+                        'Наименование': name,
+                        'Кол-во': qty,
+                        'Цена': price,
+                        'Сумма': total,
+                    })
+            except (IndexError, ValueError):
+                continue
     return items
+
 
 uploaded_files = st.file_uploader(
     "Выберите PDF-файлы (можно много)",
@@ -95,15 +129,14 @@ if uploaded_files:
         tables_found = 0
         headers_found = 0
         is_upd = False
-        
+
         try:
             with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
                 full_text = ""
                 for page in pdf.pages:
-                    # Собираем весь текст для поиска УПД
                     full_text += page.extract_text() + "\n"
-                    
-                    # 1. Пробуем стандартный парсер (для счетов)
+
+                    # 1. Стандартный парсер для счетов
                     tables = page.extract_tables()
                     for table in tables:
                         if not table or len(table) < 2:
@@ -117,17 +150,21 @@ if uploaded_files:
                         for row in table[header_row + 1:]:
                             if not looks_like_item_row(row):
                                 continue
+
                             def get(key):
                                 idx = col_map.get(key)
                                 return row[idx] if idx is not None and idx < len(row) else None
+
                             name = get('name')
                             qty = parse_money(get('qty'))
                             price = parse_money(get('price'))
                             total = parse_money(get('total'))
+
                             if total is None and price is None:
                                 continue
                             if total is None and qty is not None and price is not None:
                                 total = qty * price
+
                             all_items.append({
                                 '_Файл': uploaded_file.name,
                                 'Наименование': str(name).strip() if name else '',
@@ -135,7 +172,7 @@ if uploaded_files:
                                 'Цена': price,
                                 'Сумма': total,
                             })
-                
+
                 # 2. Если стандартный парсер не нашел позиций, пробуем УПД
                 if len(all_items) == file_items_before:
                     upd_items = extract_upd_items(full_text, uploaded_file.name)
@@ -166,7 +203,7 @@ if uploaded_files:
         final_df = pd.DataFrame(all_items)
         final_df = final_df[final_df['Сумма'].notna()].copy()
 
-        # --- Удаление дублей (один файл на счет/УПД) ---
+        # Удаление дублей (один файл на документ)
         def base_invoice(filename):
             name = re.sub(r'\.pdf$', '', filename, flags=re.I)
             name = re.sub(r'\s*\(\d+\)\s*', '', name)
