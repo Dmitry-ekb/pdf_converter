@@ -56,54 +56,63 @@ def find_header_and_cols(table):
 
 
 def extract_upd_items(text, filename):
-    """Специальный парсер для УПД (ищет строку с товаром)."""
+    """Специальный парсер для УПД. Ищет строку с товаром и берёт последнее число как сумму."""
     items = []
     lines = text.split('\n')
     for line in lines:
-        # Ищем строки, которые содержат код товара и ключевые слова
-        if re.search(r'\d{2}-\d{8}', line) and ('щебень' in line.lower() or 'отсев' in line.lower()):
+        # Ищем строки с кодом товара и ключевыми словами
+        if re.search(r'(\d{2}-\d{8}|\d{10,})', line) and (
+                'щебень' in line.lower() or 'отсев' in line.lower() or 'песок' in line.lower()):
             parts = line.split()
             try:
-                # Ищем индекс единицы измерения
+                # Ищем единицу измерения
                 unit_idx = -1
                 for i, p in enumerate(parts):
                     if p.lower() in ['м3', 'шт', 'т', 'кг', 'л', 'м2', 'рейс']:
                         unit_idx = i
                         break
-                if unit_idx == -1:
+                if unit_idx == -1 or unit_idx < 1:
                     continue
-                
-                # Количество — элемент перед единицей измерения
+
+                # Количество — перед единицей измерения
                 qty = parse_money(parts[unit_idx - 1])
-                # Цена — элемент после единицы измерения
-                price = parse_money(parts[unit_idx + 1])
-                
-                # Сумма может быть разбита на части
-                total_parts = []
-                for p in parts[unit_idx + 2:]:
-                    if parse_money(p) is not None:
-                        total_parts.append(p)
-                    else:
+                if qty is None:
+                    continue
+
+                # Сумма — ПОСЛЕДНЕЕ число в строке (итог с налогом)
+                total = None
+                for p in reversed(parts):
+                    parsed = parse_money(p)
+                    if parsed is not None and parsed > 100:
+                        total = parsed
                         break
+                if total is None:
+                    continue
+
+                # Цена — число перед стоимостью без налога.
+                # Ищем числа после единицы измерения: [цена, стоимость_без_налога, ..., сумма]
+                nums_after_unit = []
+                for p in parts[unit_idx + 1:]:
+                    parsed = parse_money(p)
+                    if parsed is not None:
+                        nums_after_unit.append(parsed)
                 
-                if len(total_parts) >= 2:
-                    total = parse_money(total_parts[0] + total_parts[1])
-                elif len(total_parts) == 1:
-                    total = parse_money(total_parts[0])
-                else:
-                    total = None
+                # Если чисел после единицы >= 3, то цена — первое из них
+                price = nums_after_unit[0] if len(nums_after_unit) >= 1 else None
                 
+                # Наименование — между номером и количеством
                 name_parts = parts[2:unit_idx - 1]
                 name = ' '.join(name_parts)
-                
-                if qty is not None and price is not None and total is not None:
-                    items.append({
-                        '_Файл': filename,
-                        'Наименование': name,
-                        'Кол-во': qty,
-                        'Цена': price,
-                        'Сумма': total,
-                    })
+                if not name:
+                    name = line[:50]
+
+                items.append({
+                    '_Файл': filename,
+                    'Наименование': name,
+                    'Кол-во': qty,
+                    'Цена': price,
+                    'Сумма': total,
+                })
             except (IndexError, ValueError):
                 continue
     return items
@@ -136,7 +145,7 @@ if uploaded_files:
                 for page in pdf.pages:
                     full_text += page.extract_text() + "\n"
 
-                    # 1. Стандартный парсер для счетов
+                    # 1. Стандартный парсер
                     tables = page.extract_tables()
                     for table in tables:
                         if not table or len(table) < 2:
@@ -203,7 +212,7 @@ if uploaded_files:
         final_df = pd.DataFrame(all_items)
         final_df = final_df[final_df['Сумма'].notna()].copy()
 
-        # Удаление дублей (один файл на документ)
+        # Удаление дублей
         def base_invoice(filename):
             name = re.sub(r'\.pdf$', '', filename, flags=re.I)
             name = re.sub(r'\s*\(\d+\)\s*', '', name)
