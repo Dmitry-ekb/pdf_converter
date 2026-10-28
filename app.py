@@ -37,7 +37,6 @@ def find_header_and_cols(table):
     """Возвращает (header_row_index, col_map) или (None, None)."""
     for r_idx, row in enumerate(table[:8]):
         row_text = ' '.join(str(c) for c in row if c).lower()
-        # Мягкие условия: ищем хотя бы одно слово из каждой группы
         name_words = ['товар', 'наимен', 'услуг', 'работ', 'описан']
         money_words = ['сумм', 'цена', 'стоим', 'итог']
         if any(w in row_text for w in name_words) and any(w in row_text for w in money_words):
@@ -67,7 +66,7 @@ if uploaded_files:
     st.info(f"Загружено файлов: {len(uploaded_files)}. Начинаю обработку...")
 
     all_items = []
-    diagnostics = []  # для отладки: что нашли в каждом файле
+    diagnostics = []
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -127,7 +126,6 @@ if uploaded_files:
 
     status_text.text("Обработка завершена.")
 
-    # --- Диагностика ---
     with st.expander("🔍 Диагностика: что нашлось в каждом файле", expanded=True):
         diag_df = pd.DataFrame(diagnostics)
         st.dataframe(diag_df, use_container_width=True)
@@ -138,25 +136,30 @@ if uploaded_files:
         final_df = pd.DataFrame(all_items)
         final_df = final_df[final_df['Сумма'].notna()].copy()
 
-        # --- Удаление дублей счетов ---
-        # Один и тот же счёт может быть в нескольких файлах: "949 (1)", "949 (2)", "949".
-        # Извлекаем "базовое имя" счёта и оставляем один файл на счёт.
+        # --- Один файл на счёт: копии (1), (2) не складываем ---
         def base_invoice(filename):
             name = re.sub(r'\.pdf$', '', filename, flags=re.I)
-            name = re.sub(r'\s*\(\d+\)\s*', '', name)  # убираем (1), (2)
+            name = re.sub(r'\s*\(\d+\)\s*', '', name)
             name = re.sub(r'\s+', ' ', name).strip().lower()
             return name
 
         final_df['_Счёт'] = final_df['_Файл'].apply(base_invoice)
-        # Сортируем так, чтобы файлы без суффикса (1)/(2) шли первыми
         final_df['_приоритет'] = final_df['_Файл'].apply(
             lambda f: 0 if not re.search(r'\(\d+\)\.pdf$', f, re.I) else 1
         )
         final_df = final_df.sort_values(['_Счёт', '_приоритет'])
-        final_df = final_df.drop_duplicates(subset=['_Счёт', 'Наименование', 'Кол-во', 'Цена', 'Сумма'])
+
+        # Для каждого счёта оставляем строки ТОЛЬКО из файла с минимальным приоритетом
+        best = final_df.groupby('_Счёт')['_приоритет'].transform('min')
+        final_df = final_df[final_df['_приоритет'] == best].copy()
+
+        # Убираем точные дубли строк
+        final_df = final_df.drop_duplicates(
+            subset=['_Счёт', 'Наименование', 'Кол-во', 'Цена', 'Сумма']
+        )
         final_df = final_df.drop(columns=['_приоритет'])
 
-        st.subheader("📋 Товарные позиции (без дублей счетов)")
+        st.subheader("📋 Товарные позиции (один файл на счёт)")
         st.dataframe(final_df.drop(columns=['_Счёт']), use_container_width=True)
 
         st.subheader("🧮 Итоги")
