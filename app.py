@@ -5,138 +5,162 @@ import io
 import re
 from datetime import datetime
 
-# --- Настройка страницы ---
 st.set_page_config(page_title="PDF Затраты: Анализ и Подсчёт", layout="wide")
 st.title("📊 Анализ затрат из PDF")
-st.markdown("Загрузите PDF-файлы. Приложение попытается извлечь таблицы и собрать их в общий отчёт.")
+st.markdown("Загрузите PDF-счета. Приложение извлечёт товарные позиции и посчитает итоги.")
 
-# --- Загрузка файлов ---
+
+def parse_money(value):
+    """'7 500,00' / '18600.00' / '1 080,00' -> float"""
+    if value is None:
+        return None
+    s = str(value).strip().replace(' ', '').replace('\xa0', '')
+    s = s.replace(',', '.')
+    s = re.sub(r'[^\d.\-]', '', s)
+    if s in ('', '.', '-'):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def looks_like_item_row(row):
+    """Строка похожа на товарную: есть текст и хотя бы 2 числа."""
+    if not row or len(row) < 4:
+        return False
+    nums = [parse_money(c) for c in row]
+    numeric_count = sum(1 for n in nums if n is not None)
+    has_text = any(c and len(str(c).strip()) > 3 for c in row)
+    return numeric_count >= 2 and has_text
+
+
 uploaded_files = st.file_uploader(
     "Выберите PDF-файлы (можно много)",
     type="pdf",
     accept_multiple_files=True,
-    help="Загрузите все 89+ файлов сразу. Обработка может занять время."
 )
 
 if uploaded_files:
     st.info(f"Загружено файлов: {len(uploaded_files)}. Начинаю обработку...")
 
-    all_tables_data = []  # Список для сбора всех строк из всех таблиц
+    all_items = []
     progress_bar = st.progress(0)
     status_text = st.empty()
 
     for i, uploaded_file in enumerate(uploaded_files):
         status_text.text(f"Обработка: {uploaded_file.name} ({i+1}/{len(uploaded_files)})")
-        
         try:
-            # Читаем PDF из байтов
             with pdfplumber.open(io.BytesIO(uploaded_file.read())) as pdf:
-                file_has_tables = False
-                
-                for page_num, page in enumerate(pdf.pages, start=1):
+                for page in pdf.pages:
                     tables = page.extract_tables()
-                    
-                    for table_idx, table in enumerate(tables):
+                    for table in tables:
                         if not table or len(table) < 2:
-                            continue  # Пропускаем пустые или слишком короткие "таблицы"
-                        
-                        # Преобразуем таблицу в DataFrame
-                        # Первую строку считаем заголовком (если она не пустая)
-                        header = table[0]
-                        # Очищаем заголовки от None и пробелов
-                        header = [str(h).strip() if h else f"Колонка_{j+1}" for j, h in enumerate(header)]
-                        
-                        data_rows = table[1:]
-                        df = pd.DataFrame(data_rows, columns=header)
-                        
-                        # Добавляем служебные колонки, чтобы знать, откуда данные
-                        df.insert(0, "_Файл", uploaded_file.name)
-                        df.insert(1, "_Страница", page_num)
-                        df.insert(2, "_Таблица", table_idx + 1)
-                        
-                        all_tables_data.append(df)
-                        file_has_tables = True
-                
-                if not file_has_tables:
-                    # Если таблиц не нашли, добавляем запись об этом
-                    all_tables_data.append(pd.DataFrame([{
-                        "_Файл": uploaded_file.name,
-                        "_Страница": "—",
-                        "_Таблица": "—",
-                        "Статус": "Таблицы не найдены (возможно, скан или нет структурированных таблиц)"
-                    }]))
-                    
+                            continue
+
+                        # Ищем строку заголовка
+                        header_row = None
+                        for r_idx, row in enumerate(table[:6]):
+                            row_text = ' '.join(str(c) for c in row if c).lower()
+                            if ('товар' in row_text or 'наимен' in row_text
+                                    or 'услуг' in row_text or 'работ' in row_text) \
+                                    and ('сумм' in row_text or 'цена' in row_text):
+                                header_row = r_idx
+                                break
+                        if header_row is None:
+                            continue
+
+                        header = table[header_row]
+                        col_map = {}
+                        for j, h in enumerate(header):
+                            h_low = str(h).lower() if h else ''
+                            if 'товар' in h_low or 'наимен' in h_low or 'услуг' in h_low or 'работ' in h_low:
+                                col_map.setdefault('name', j)
+                            elif 'кол' in h_low:
+                                col_map.setdefault('qty', j)
+                            elif 'цена' in h_low:
+                                col_map.setdefault('price', j)
+                            elif 'сумм' in h_low:
+                                col_map.setdefault('total', j)
+
+                        if 'total' not in col_map and 'price' not in col_map:
+                            continue
+
+                        for row in table[header_row + 1:]:
+                            if not looks_like_item_row(row):
+                                continue
+
+                            def get(key):
+                                idx = col_map.get(key)
+                                return row[idx] if idx is not None and idx < len(row) else None
+
+                            name = get('name')
+                            qty = parse_money(get('qty'))
+                            price = parse_money(get('price'))
+                            total = parse_money(get('total'))
+
+                            if total is None and price is None:
+                                continue
+                            if total is None and qty is not None and price is not None:
+                                total = qty * price
+
+                            all_items.append({
+                                '_Файл': uploaded_file.name,
+                                'Наименование': str(name).strip() if name else '',
+                                'Кол-во': qty,
+                                'Цена': price,
+                                'Сумма': total,
+                            })
         except Exception as e:
-            # Если файл не удалось прочитать, фиксируем ошибку
-            all_tables_data.append(pd.DataFrame([{
-                "_Файл": uploaded_file.name,
-                "_Страница": "—",
-                "_Таблица": "—",
-                "Ошибка": str(e)
-            }]))
-        
+            st.warning(f"Ошибка в файле {uploaded_file.name}: {e}")
+
         progress_bar.progress((i + 1) / len(uploaded_files))
 
-    status_text.text("Обработка завершена. Формирую отчёт...")
+    status_text.text("Обработка завершена.")
 
-    # --- Сборка итогового отчёта ---
-    if all_tables_data:
-        # Объединяем все таблицы в один большой DataFrame
-        # (колонки могут не совпадать, pandas выровняет их, заполнив пропуски)
-        final_df = pd.concat(all_tables_data, ignore_index=True)
-        
-        st.subheader("📋 Предварительный просмотр извлечённых данных")
-        st.dataframe(final_df.head(100))  # Показываем первые 100 строк для скорости
-        
-        # --- Попытка автоматического поиска числовых колонок для подсчёта ---
-        st.subheader("🧮 Итоговые подсчёты (автоматическая попытка)")
-        
-        # Ищем колонки, которые выглядят как числовые (содержат цифры)
-        numeric_cols = []
-        for col in final_df.columns:
-            if col.startswith("_"):  # Пропускаем служебные
-                continue
-            # Пробуем преобразовать в числа, убирая пробелы и запятые
-            sample = final_df[col].dropna().astype(str).str.replace(' ', '').str.replace(',', '.')
-            # Если хотя бы половина непустых значений — числа, считаем колонку числовой
-            try:
-                converted = pd.to_numeric(sample, errors='coerce')
-                if converted.notna().sum() > len(converted) * 0.5:
-                    numeric_cols.append(col)
-            except:
-                pass
-        
-        if numeric_cols:
-            st.write(f"Найдены потенциально числовые колонки: **{', '.join(numeric_cols)}**")
-            
-            for col in numeric_cols:
-                # Очищаем и преобразуем
-                series = final_df[col].astype(str).str.replace(' ', '').str.replace(',', '.')
-                numeric_series = pd.to_numeric(series, errors='coerce')
-                total = numeric_series.sum()
-                st.metric(label=f"Сумма по колонке «{col}»", value=f"{total:,.2f}".replace(',', ' '))
+    if all_items:
+        final_df = pd.DataFrame(all_items)
+        final_df = final_df[final_df['Сумма'].notna()].copy()
+        # Убираем возможные дубли (один и тот же файл мог встретиться дважды)
+        final_df = final_df.drop_duplicates()
+
+        if final_df.empty:
+            st.warning("Товарные строки с суммами не найдены.")
         else:
-            st.warning("Автоматически числовые колонки для подсчёта не найдены. Проверьте данные вручную.")
-        
-        # --- Кнопка скачивания Excel ---
-        st.subheader("💾 Скачать результат")
-        
-        # Создаём Excel в памяти
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            final_df.to_excel(writer, index=False, sheet_name='Все данные')
-        output.seek(0)
-        
-        st.download_button(
-            label="📥 Скачать Excel-файл со всеми таблицами",
-            data=output,
-            file_name=f"pdf_затраты_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        
-        st.caption(f"Всего строк в отчёте: {len(final_df)}")
-        
+            st.subheader("📋 Товарные позиции из всех счетов")
+            st.dataframe(final_df, use_container_width=True)
+
+            st.subheader("🧮 Итоги")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Всего позиций", len(final_df))
+            c2.metric("Общая сумма", f"{final_df['Сумма'].sum():,.2f}".replace(',', ' '))
+            c3.metric("Уникальных счетов", final_df['_Файл'].nunique())
+
+            st.subheader("📊 Сумма по каждому счёту")
+            by_file = final_df.groupby('_Файл', as_index=False)['Сумма'].sum()
+            by_file.columns = ['Файл', 'Итоговая сумма']
+            st.dataframe(by_file, use_container_width=True)
+
+            st.subheader("📦 Свод по наименованиям")
+            by_name = (final_df.groupby('Наименование', as_index=False)
+                       .agg(**{'Кол-во позиций': ('Сумма', 'count'),
+                               'Итого сумма': ('Сумма', 'sum')}))
+            st.dataframe(by_name, use_container_width=True)
+
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                final_df.to_excel(writer, index=False, sheet_name='Позиции')
+                by_file.to_excel(writer, index=False, sheet_name='Итоги по счетам')
+                by_name.to_excel(writer, index=False, sheet_name='Свод по наименованиям')
+            output.seek(0)
+
+            st.download_button(
+                "📥 Скачать Excel (позиции + итоги + свод)",
+                data=output,
+                file_name=f"затраты_свод_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
     else:
-        st.error("Не удалось извлечь данные ни из одного файла.")
+        st.warning("Товарные строки не найдены. Возможно, PDF — сканы без текстового слоя.")
 else:
     st.info("👆 Загрузите PDF-файлы, чтобы начать.")
