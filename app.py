@@ -56,39 +56,73 @@ def find_header_and_cols(table):
 
 
 def extract_upd_items(text, filename):
-    """Парсер для УПД: ищет цену и сумму по паттерну 'цена ... сумма ... Без акциза'."""
+    """
+    Парсер для УПД. Ищет строку с товаром и разбирает её по порядку колонок:
+    [Код] [№] [Наименование] [Ед.изм] [Кол-во (3)] [Цена (4)] [Стоимость без налога (5)] ... [Налог (8)] [Стоимость с налогом (9)]
+    """
     items = []
     lines = text.split('\n')
     for line in lines:
-        if re.search(r'(\d{2}-\d{8}|\d{10,})', line) and (
-                'щебень' in line.lower() or 'отсев' in line.lower() or 'песок' in line.lower()):
-            # Ищем паттерн: "20.00 696.72 13 934.43 Без акциза" или "20.00 819.67 16 393.44 Без акциза"
-            match = re.search(
-                r'(\d+)\s+(м3|шт|т|кг|л|м2|рейс)\s+([\d.,]+)\s+([\d\s.,]+)\s+([\d\s.,]+)\s+Без акциза',
-                line, re.IGNORECASE
-            )
-            if match:
-                qty = parse_money(match.group(1))
-                price = parse_money(match.group(3))
-                # group(4) — стоимость без налога, group(5) — сумма с налогом
-                total_without_tax = parse_money(match.group(4))
-                total_with_tax = parse_money(match.group(5))
-                
-                # Берём сумму с налогом, если она есть, иначе без налога
-                total = total_with_tax if total_with_tax else total_without_tax
-                
-                # Наименование — всё до количества
-                name_match = re.search(r'\d+\s+(.+?)\s+\d+\s+(м3|шт|т|кг|л|м2|рейс)', line)
-                name = name_match.group(1).strip() if name_match else line[:50]
-                
-                if qty and price and total:
-                    items.append({
-                        '_Файл': filename,
-                        'Наименование': name,
-                        'Кол-во': qty,
-                        'Цена': price,
-                        'Сумма': total,
-                    })
+        # Ищем строки с товаром (содержат единицу измерения и ключевые слова)
+        if not any(unit in line.lower() for unit in ['м3', 'шт', 'т ', 'кг', 'л ', 'м2', 'рейс']):
+            continue
+        if not ('щебень' in line.lower() or 'отсев' in line.lower() or 'песок' in line.lower()):
+            continue
+
+        parts = line.split()
+        try:
+            # Находим индекс единицы измерения
+            unit_idx = -1
+            for i, p in enumerate(parts):
+                if p.lower() in ['м3', 'шт', 'т', 'кг', 'л', 'м2', 'рейс']:
+                    unit_idx = i
+                    break
+            if unit_idx == -1 or unit_idx < 2:
+                continue
+
+            # Наименование — всё от начала (после кода и номера) до единицы измерения
+            # Обычно код и номер — первые 1-2 элемента
+            name_start = 0
+            if re.match(r'(\d{2}-\d{8}|\d{10,})', parts[0]):
+                name_start = 2  # пропускаем код и номер
+            name_parts = parts[name_start:unit_idx]
+            name = ' '.join(name_parts).strip()
+
+            # Кол-во — число перед единицей измерения
+            qty = parse_money(parts[unit_idx - 1])
+
+            # После единицы измерения идут: Цена (4), Стоимость без налога (5), ..., Налог (8), Стоимость с налогом (9)
+            nums_after = []
+            for p in parts[unit_idx + 1:]:
+                parsed = parse_money(p)
+                if parsed is not None:
+                    nums_after.append(parsed)
+
+            # nums_after обычно: [цена, стоимость_без_налога, налог, стоимость_с_налогом]
+            # Но сумма без налога может быть разбита на два числа (13 934.43)
+            # Поэтому нужно аккуратно собрать значения.
+
+            # Цена — первое число после единицы (если оно есть)
+            price = nums_after[0] if len(nums_after) > 0 else None
+
+            # Итоговая сумма с налогом — последнее число в строке (обычно 17 000.00)
+            total_with_tax = nums_after[-1] if len(nums_after) > 1 else None
+
+            # Если последнее число слишком маленькое (например, 000.00), пробуем склеить с предыдущим
+            if total_with_tax is not None and total_with_tax < 1000 and len(nums_after) > 2:
+                # Пробуем склеить последние два числа
+                total_with_tax = float(f"{int(nums_after[-2])}{int(nums_after[-1])}") if nums_after[-2] else total_with_tax
+
+            if qty is not None and price is not None and total_with_tax is not None:
+                items.append({
+                    '_Файл': filename,
+                    'Наименование': name,
+                    'Кол-во': qty,
+                    'Цена': price,
+                    'Сумма': total_with_tax,
+                })
+        except (IndexError, ValueError):
+            continue
     return items
 
 
