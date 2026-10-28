@@ -56,65 +56,39 @@ def find_header_and_cols(table):
 
 
 def extract_upd_items(text, filename):
-    """Специальный парсер для УПД. Ищет строку с товаром и берёт последнее число как сумму."""
+    """Парсер для УПД: ищет цену и сумму по паттерну 'цена ... сумма ... Без акциза'."""
     items = []
     lines = text.split('\n')
     for line in lines:
-        # Ищем строки с кодом товара и ключевыми словами
         if re.search(r'(\d{2}-\d{8}|\d{10,})', line) and (
                 'щебень' in line.lower() or 'отсев' in line.lower() or 'песок' in line.lower()):
-            parts = line.split()
-            try:
-                # Ищем единицу измерения
-                unit_idx = -1
-                for i, p in enumerate(parts):
-                    if p.lower() in ['м3', 'шт', 'т', 'кг', 'л', 'м2', 'рейс']:
-                        unit_idx = i
-                        break
-                if unit_idx == -1 or unit_idx < 1:
-                    continue
-
-                # Количество — перед единицей измерения
-                qty = parse_money(parts[unit_idx - 1])
-                if qty is None:
-                    continue
-
-                # Сумма — ПОСЛЕДНЕЕ число в строке (итог с налогом)
-                total = None
-                for p in reversed(parts):
-                    parsed = parse_money(p)
-                    if parsed is not None and parsed > 100:
-                        total = parsed
-                        break
-                if total is None:
-                    continue
-
-                # Цена — число перед стоимостью без налога.
-                # Ищем числа после единицы измерения: [цена, стоимость_без_налога, ..., сумма]
-                nums_after_unit = []
-                for p in parts[unit_idx + 1:]:
-                    parsed = parse_money(p)
-                    if parsed is not None:
-                        nums_after_unit.append(parsed)
+            # Ищем паттерн: "20.00 696.72 13 934.43 Без акциза" или "20.00 819.67 16 393.44 Без акциза"
+            match = re.search(
+                r'(\d+)\s+(м3|шт|т|кг|л|м2|рейс)\s+([\d.,]+)\s+([\d\s.,]+)\s+([\d\s.,]+)\s+Без акциза',
+                line, re.IGNORECASE
+            )
+            if match:
+                qty = parse_money(match.group(1))
+                price = parse_money(match.group(3))
+                # group(4) — стоимость без налога, group(5) — сумма с налогом
+                total_without_tax = parse_money(match.group(4))
+                total_with_tax = parse_money(match.group(5))
                 
-                # Если чисел после единицы >= 3, то цена — первое из них
-                price = nums_after_unit[0] if len(nums_after_unit) >= 1 else None
+                # Берём сумму с налогом, если она есть, иначе без налога
+                total = total_with_tax if total_with_tax else total_without_tax
                 
-                # Наименование — между номером и количеством
-                name_parts = parts[2:unit_idx - 1]
-                name = ' '.join(name_parts)
-                if not name:
-                    name = line[:50]
-
-                items.append({
-                    '_Файл': filename,
-                    'Наименование': name,
-                    'Кол-во': qty,
-                    'Цена': price,
-                    'Сумма': total,
-                })
-            except (IndexError, ValueError):
-                continue
+                # Наименование — всё до количества
+                name_match = re.search(r'\d+\s+(.+?)\s+\d+\s+(м3|шт|т|кг|л|м2|рейс)', line)
+                name = name_match.group(1).strip() if name_match else line[:50]
+                
+                if qty and price and total:
+                    items.append({
+                        '_Файл': filename,
+                        'Наименование': name,
+                        'Кол-во': qty,
+                        'Цена': price,
+                        'Сумма': total,
+                    })
     return items
 
 
@@ -145,7 +119,7 @@ if uploaded_files:
                 for page in pdf.pages:
                     full_text += page.extract_text() + "\n"
 
-                    # 1. Стандартный парсер
+                    # 1. Стандартный парсер для счетов
                     tables = page.extract_tables()
                     for table in tables:
                         if not table or len(table) < 2:
