@@ -57,13 +57,20 @@ def find_header_and_cols(table):
 
 def extract_upd_items(text, filename):
     """
-    Парсер для УПД. Ищет строку с товаром и разбирает её по порядку колонок:
-    [Код] [№] [Наименование] [Ед.изм] [Кол-во (3)] [Цена (4)] [Стоимость без налога (5)] ... [Налог (8)] [Стоимость с налогом (9)]
+    Парсер для УПД. Строго следует вашей таблице колонок:
+    1а: Наименование
+    2а: Ед. изм. (Условное обозначение)
+    3:  Количество (объем)
+    4:  Цена (тариф) за единицу измерения
+    5:  Стоимость без налога – всего
+    8:  Сумма налога
+    9:  Стоимость с налогом – всего
     """
     items = []
     lines = text.split('\n')
+    
     for line in lines:
-        # Ищем строки с товаром (содержат единицу измерения и ключевые слова)
+        # Ищем строки с товаром (щебень, отсев) и единицей измерения
         if not any(unit in line.lower() for unit in ['м3', 'шт', 'т ', 'кг', 'л ', 'м2', 'рейс']):
             continue
         if not ('щебень' in line.lower() or 'отсев' in line.lower() or 'песок' in line.lower()):
@@ -71,7 +78,7 @@ def extract_upd_items(text, filename):
 
         parts = line.split()
         try:
-            # Находим индекс единицы измерения
+            # 1. Находим индекс колонки 2а (Ед. изм.) - это 'м3' или 'шт' и т.д.
             unit_idx = -1
             for i, p in enumerate(parts):
                 if p.lower() in ['м3', 'шт', 'т', 'кг', 'л', 'м2', 'рейс']:
@@ -80,38 +87,43 @@ def extract_upd_items(text, filename):
             if unit_idx == -1 or unit_idx < 2:
                 continue
 
-            # Наименование — всё от начала (после кода и номера) до единицы измерения
-            # Обычно код и номер — первые 1-2 элемента
-            name_start = 0
-            if re.match(r'(\d{2}-\d{8}|\d{10,})', parts[0]):
-                name_start = 2  # пропускаем код и номер
+            # 1а: Наименование — всё от начала (после кода и номера) до колонки 2а (Ед. изм.)
+            # Код и номер обычно первые 2 элемента (например, "00-00000022 1")
+            name_start = 2 if re.match(r'(\d{2}-\d{8}|\d{10,})', parts[0]) else 0
             name_parts = parts[name_start:unit_idx]
             name = ' '.join(name_parts).strip()
 
-            # Кол-во — число перед единицей измерения
+            # 3: Количество — число ПЕРЕД колонкой 2а (Ед. изм.)
             qty = parse_money(parts[unit_idx - 1])
 
-            # После единицы измерения идут: Цена (4), Стоимость без налога (5), ..., Налог (8), Стоимость с налогом (9)
-            nums_after = []
-            for p in parts[unit_idx + 1:]:
+            # 4: Цена — число СРАЗУ ПОСЛЕ колонки 2а (Ед. изм.)
+            price = parse_money(parts[unit_idx + 1])
+
+            # 5, 8, 9: Все числа после цены
+            nums_after_price = []
+            for p in parts[unit_idx + 2:]:
                 parsed = parse_money(p)
                 if parsed is not None:
-                    nums_after.append(parsed)
+                    nums_after_price.append(parsed)
 
-            # nums_after обычно: [цена, стоимость_без_налога, налог, стоимость_с_налогом]
-            # Но сумма без налога может быть разбита на два числа (13 934.43)
-            # Поэтому нужно аккуратно собрать значения.
+            # В строке: [Цена (4)] [Стоимость без налога (5)] ... [Сумма налога (8)] [Стоимость с налогом (9)]
+            # nums_after_price[0] = Стоимость без налога (5)
+            # nums_after_price[-1] = Стоимость с налогом (9) (обычно последнее число)
 
-            # Цена — первое число после единицы (если оно есть)
-            price = nums_after[0] if len(nums_after) > 0 else None
-
-            # Итоговая сумма с налогом — последнее число в строке (обычно 17 000.00)
-            total_with_tax = nums_after[-1] if len(nums_after) > 1 else None
-
-            # Если последнее число слишком маленькое (например, 000.00), пробуем склеить с предыдущим
-            if total_with_tax is not None and total_with_tax < 1000 and len(nums_after) > 2:
-                # Пробуем склеить последние два числа
-                total_with_tax = float(f"{int(nums_after[-2])}{int(nums_after[-1])}") if nums_after[-2] else total_with_tax
+            total_with_tax = None
+            if len(nums_after_price) >= 2:
+                # Берем последнее число как колонку 9 (Стоимость с налогом)
+                # Но если оно разбито (например, "17" и "000.00"), склеиваем два последних
+                last_num = nums_after_price[-1]
+                prev_num = nums_after_price[-2]
+                
+                # Если последнее число маленькое (например, 000.00), а предыдущее целое (17)
+                if last_num < 1000 and prev_num >= 10:
+                    total_with_tax = float(f"{int(prev_num)}{int(last_num)}")
+                else:
+                    total_with_tax = last_num
+            elif len(nums_after_price) == 1:
+                total_with_tax = nums_after_price[0]
 
             if qty is not None and price is not None and total_with_tax is not None:
                 items.append({
